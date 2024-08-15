@@ -1,0 +1,212 @@
+from typing import Annotated, List, Optional
+import asyncio
+from rich.console import Console
+from typer import Typer, Option, Argument, prompt, style
+from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn
+import random
+from gql import Client as GQLClient
+from gql.transport.aiohttp import AIOHTTPTransport as GQLAIOHTTPTransport
+
+from ommnia_sso_client import Client, ClientFactory, ClientSettings
+from ommnia_sso_cli.data.repositories.groups_repository import GroupsRepository
+from ommnia_sso_cli.data.repositories.users_repository import UsersRepository
+from ommnia_sso_cli.data.models import Config
+from ommnia_sso_cli.data.models.user import RegularUserSchema, UserStatus
+
+console = Console(stderr=False)
+err_console = Console(stderr=True)
+
+PERMISSIONS = [
+    "ommnia_sso.groups.create",
+    "ommnia_sso.groups.read",
+    "ommnia_sso.groups.update",
+    "ommnia_sso.groups.delete",
+    "ommnia_sso.users.create",
+    "ommnia_sso.users.read",
+    "ommnia_sso.users.update",
+    "ommnia_sso.users.delete",
+    "ommnia_sso.permissions.create",
+    "ommnia_sso.permissions.read",
+    "ommnia_sso.permissions.update",
+    "ommnia_sso.permissions.delete",
+    "ommnia_sso.login_sessions.create",
+    "ommnia_sso.login_sessions.read",
+    "ommnia_sso.login_sessions.update",
+    "ommnia_sso.login_sessions.delete",
+    "ommnia_sso.restore_sessions.create",
+    "ommnia_sso.restore_sessions.read",
+    "ommnia_sso.restore_sessions.update",
+    "ommnia_sso.restore_sessions.delete",
+]
+
+app: Typer = Typer()
+
+global users_repository
+global groups_repository
+
+users_repository: Optional[UsersRepository] = None
+groups_repository: Optional[GroupsRepository] = None
+
+
+@app.callback()
+def setup():
+    with Config("config.toml") as config:
+        if config.endpoint is None:
+            config.endpoint = prompt(
+                "Enter the GraphQL server URL",
+                default="http://localhost:8000/graphql",
+                type=str,
+            )
+
+        if config.app_name is None:
+            config.app_name = prompt(
+                "Enter the app name of the current client",
+                default="ommnia_sso_cli",
+                type=str,
+            )
+
+        if config.server_public_key_path is None:
+            config.server_public_key_path = prompt(
+                "Enter the public key path of the server",
+                default="keys/server/jwt_public_key.pem",
+                type=str,
+            )
+
+        if config.client_private_key_path is None:
+            config.client_private_key_path = prompt(
+                "Enter the private key path of the client",
+                default="keys/client/jwt_private_key.pem",
+                type=str,
+            )
+
+        if config.email is None:
+            config.email = prompt("Enter your email address", type=str)
+
+        if config.password is None:
+            config.password = prompt("Enter your password", type=str)
+
+        assert config.client_private_key_path is not None
+        with open(config.client_private_key_path, "r") as client_private_key_file:
+            client_private_key: str = client_private_key_file.read()
+
+        assert config.server_public_key_path is not None
+        with open(config.server_public_key_path, "r") as server_public_key_file:
+            server_public_key: str = server_public_key_file.read()
+
+        assert config.endpoint is not None
+        assert config.app_name is not None
+        client = ClientFactory().create(
+            ClientSettings(
+                graphql_server_url=config.endpoint,
+                app_name=config.app_name,
+                client_private_key=client_private_key,
+                server_public_key=server_public_key,
+            )
+        )
+
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+            ) as progress:
+                task: TaskID = progress.add_task(description="Creating login session", total=100)
+                login_token: str = asyncio.run(
+                    client.create_login_token("", optional_permissions=PERMISSIONS)
+                )
+                progress.update(task, completed=100)
+
+                assert config.email is not None
+                assert config.password is not None
+
+                task = progress.add_task(description="Logging in", total=100)
+                config.bearer = asyncio.run(
+                    client.regular_login(config.email, config.password, login_token)
+                )
+                progress.update(task, completed=100)
+
+        except Client.RegularLoginException as exception:
+            err_console.print(f"Failed to authenticate ({exception.code}): {exception.message}")
+            exit(-1)
+
+    client = GQLClient(
+        transport=GQLAIOHTTPTransport(
+            config.endpoint, headers={"Authorization": f"Bearer {config.bearer}"}
+        )
+    )
+
+    global users_repository
+    global groups_repository
+
+    users_repository = UsersRepository(client)
+    groups_repository = GroupsRepository(client)
+
+
+users_app: Typer = Typer()
+app.add_typer(users_app, name="users")
+
+groups_app: Typer = Typer()
+app.add_typer(groups_app, name="groups")
+
+login_sessions_app: Typer = Typer()
+app.add_typer(login_sessions_app, name="login-sessions")
+
+
+def generate_password(k: int = 16) -> str:
+    random_dict: str = (
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-@/+=()*&^%$,.?\"'><"
+    )
+    return "".join(random.choices(random_dict, k=k))
+
+
+
+
+@users_app.command("create")
+def create_user(
+    name: Annotated[str, Argument(help="The name of the user")],
+    email: Annotated[str, Argument(help="The email address for the user.")],
+    groups: Annotated[
+        List[str],
+        Option(help="The names of the groups that the user should be added to."),
+    ] = [],
+    permissions: Annotated[
+        List[str], Option(help="The permissions that should be granted to the user.")
+    ] = [],
+    password: Annotated[
+        Optional[str],
+        Argument(help="The password for the user, will be generated if not specified."),
+    ] = None,
+    status: Annotated[
+        UserStatus,
+        Option(case_sensitive=False, help="The status of the user to be created."),
+    ] = UserStatus.ACTIVE,
+    password_length: Annotated[
+        int, Option(help="The length of the randomly generated password.")
+    ] = 16,
+):
+    # Generate a random password if not specified.
+    if password is None:
+        password = generate_password(password_length)
+        print(f"Creating user with password: {style(password, fg='green')}")
+
+    # Create the create user mutation arguments.
+    mutation_args = UsersRepository.CreateUserMutationArguments(
+        name=name,
+        email=email,
+        password=password,
+        status=status,
+        groups=groups,
+        permissions=permissions,
+    )
+
+    # Perform the mutation.
+    assert users_repository is not None, "The users repository should be defined"
+    result = asyncio.run(users_repository.create_user(mutation_args))
+
+    if isinstance(result, UsersRepository.CreateUserMutationFailure):
+        print(f"Failed to create the user ({style(result.code.value, fg='red', bold=True)}) : {style(result.message, italic=True)}")
+        return
+
+    assert isinstance(result, RegularUserSchema), f"Got result: {result}"
+
+    print(f"User created successfully, assigned uid: {style(result.uid, fg='green')}")
